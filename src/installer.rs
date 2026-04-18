@@ -34,7 +34,7 @@ const STATE_FILE: &str = ".rv-install-state.json";
 /// 1. Group packages into "tiers" — packages whose deps are all satisfied
 /// 2. Install each tier in parallel (within a tier, packages are independent)
 /// 3. Track progress for resume capability
-pub async fn install(resolved: &ResolvedDeps) -> Result<()> {
+pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> {
     use colored::Colorize;
 
     let total = resolved.packages.len();
@@ -42,7 +42,7 @@ pub async fn install(resolved: &ResolvedDeps) -> Result<()> {
     let mut failed: Vec<(String, String)> = Vec::new(); // (name, error)
 
     // Find packages already installed on this system
-    let already_installed = check_already_installed(&resolved.packages);
+    let already_installed = check_installed_versions(&resolved.packages);
     for name in &already_installed {
         println!("  {} {} (already installed)", "✓".green(), name.dimmed());
         installed.insert(name.clone());
@@ -102,7 +102,7 @@ pub async fn install(resolved: &ResolvedDeps) -> Result<()> {
             .par_iter()
             .map(|pkg| {
                 pb.set_message(pkg.name.clone());
-                let result = install_single_package(pkg);
+                let result = install_single_package(pkg,&bioc_version);
                 pb.inc(1);
                 (pkg.name.clone(), result)
             })
@@ -169,7 +169,7 @@ pub async fn install(resolved: &ResolvedDeps) -> Result<()> {
 }
 
 /// Install a single R package from source using R CMD INSTALL
-fn install_single_package(pkg: &ResolvedPackage) -> Result<()> {
+fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<()> {
     // Construct the download URL
     let url = match pkg.source.as_str() {
         "cran" => format!(
@@ -177,8 +177,8 @@ fn install_single_package(pkg: &ResolvedPackage) -> Result<()> {
             pkg.name, pkg.version
         ),
         "bioc" => format!(
-            "https://bioconductor.org/packages/3.19/bioc/src/contrib/{}_{}.tar.gz",
-            pkg.name, pkg.version
+            "https://bioconductor.org/packages/{}/bioc/src/contrib/{}_{}.tar.gz",
+            bioc_version, pkg.name, pkg.version
         ),
         _ => anyhow::bail!("Unknown source: {}", pkg.source),
     };
@@ -330,7 +330,7 @@ fn parse_compile_error(stderr: &str) -> String {
 }
 
 /// Check which packages from the resolved set are already installed
-fn check_already_installed(packages: &[ResolvedPackage]) -> Vec<String> {
+pub fn check_installed_versions(packages: &[ResolvedPackage]) -> Vec<String> {
     // Run R to get installed packages WITH their versions
     let output = Command::new("R")
         .args(["--vanilla", "--slave", "-e", 
