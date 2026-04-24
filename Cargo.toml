@@ -32,7 +32,7 @@ tokio = { version = "1", features = ["full"] }
 # --- HTTP Client ---
 # reqwest: HTTP client (like Python's requests library).
 # We need it to download PACKAGES files from CRAN/Bioconductor.
-reqwest = { version = "0.12", features = ["gzip", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls"] }
 
 # --- Serialization ---
 # serde: Rust's serialization framework (like json module in Python).
