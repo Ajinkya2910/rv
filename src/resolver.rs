@@ -129,11 +129,11 @@ fn resolve_recursive(
     // and collect into a Vec. This is zero-cost — the compiler optimizes
     // it into a single loop.
     let dep_names: Vec<String> = metadata
-        .depends
+        .depends()
         .iter()
         .map(|d| d.name.clone())
-        .chain(metadata.imports.iter().map(|d| d.name.clone()))
-        .chain(metadata.linking_to.iter().cloned())
+        .chain(metadata.imports().iter().map(|d| d.name.clone()))
+        .chain(metadata.linking_to().iter().cloned())
         .collect();
 
     // Resolve each dependency first (recursion!)
@@ -146,10 +146,10 @@ fn resolve_recursive(
 
     // NOW add this package (after all deps are resolved)
     resolved.push(ResolvedPackage {
-        name: metadata.name.clone(),
-        version: metadata.version.clone(),
-        source: metadata.source.to_string(),
-        needs_compilation: metadata.needs_compilation,
+        name: metadata.name().to_string(),
+        version: metadata.version().to_string(),
+        source: metadata.source_label().to_string(),
+        needs_compilation: metadata.needs_compilation(),
         dependencies: dep_names,
         sha256: None, // Computed later during download
     });
@@ -185,10 +185,10 @@ pub fn find_dependency_paths(
     for pkg_name in &in_scope {
         if let Some(metadata) = registry.get(pkg_name) {
             let all_deps: Vec<&str> = metadata
-                .depends
+                .depends()
                 .iter()
                 .map(|d| d.name.as_str())
-                .chain(metadata.imports.iter().map(|d| d.name.as_str()))
+                .chain(metadata.imports().iter().map(|d| d.name.as_str()))
                 .collect();
 
             if all_deps.contains(&target) {

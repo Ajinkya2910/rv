@@ -78,6 +78,42 @@ pub enum PackageSource {
     Bioconductor,
     // Future: GitHub, R-universe
 }
+/// Common interface for package metadata, regardless of source.
+///
+/// RUST CONCEPT: trait
+/// Like a Python abstract base class or a Java interface — a contract that
+/// types can implement. The resolver works against this trait, so it doesn't
+/// care if a package came from CRAN, Bioconductor, or GitHub.
+///
+/// All methods return references (&) — no ownership transfer, no allocations.
+pub trait PackageMeta {
+    fn name(&self) -> &str;
+    fn version(&self) -> &str;
+    fn depends(&self) -> &[Dependency];
+    fn imports(&self) -> &[Dependency];
+    fn linking_to(&self) -> &[String];
+    fn needs_compilation(&self) -> bool;
+    fn system_requirements(&self) -> Option<&str>;
+      fn source_label(&self) -> &'static str;  
+}
+
+impl PackageMeta for PackageMetadata {
+    fn name(&self) -> &str { &self.name }
+    fn version(&self) -> &str { &self.version }
+    fn depends(&self) -> &[Dependency] { &self.depends }
+    fn imports(&self) -> &[Dependency] { &self.imports }
+    fn linking_to(&self) -> &[String] { &self.linking_to }
+    fn needs_compilation(&self) -> bool { self.needs_compilation }
+    fn system_requirements(&self) -> Option<&str> {
+        self.system_requirements.as_deref()
+    }
+     fn source_label(&self) -> &'static str {   // NEW
+        match self.source {
+            PackageSource::Cran => "cran",
+            PackageSource::Bioconductor => "bioc",
+        }
+     }
+}
 
 // RUST CONCEPT: Display trait
 // Implementing `Display` lets you control how a type prints with `{}`.
@@ -191,14 +227,22 @@ impl Registry {
         })
     }
 
-    /// Look up a package by name
+    /// Look up a package by name — returns the latest/best version as a trait object.
     ///
-    /// RUST CONCEPT: Option<&T>
-    /// This returns Option<&PackageMetadata> — either Some(&package) or None.
-    /// The `&` means we're returning a reference (borrow), not a copy.
-    /// The caller can read the data but doesn't own it.
-    /// Look up a package by name — returns the latest/best version
-    pub fn get(&self, name: &str) -> Option<&PackageMetadata> {
+    /// RUST CONCEPT: &dyn Trait
+    /// Returns a reference to "something that implements PackageMeta" — could be
+    /// a CRAN package, a Bioconductor package, or (later) a GitHub package.
+    /// The resolver doesn't need to know which.
+    pub fn get(&self, name: &str) -> Option<&dyn PackageMeta> {
+        self.packages
+            .get(name)
+            .and_then(|versions| versions.first())
+            .map(|p| p as &dyn PackageMeta)
+    }
+
+    /// CRAN/Bioc-only lookup that returns the concrete type.
+    /// Used by archive-version logic which needs to clone PackageMetadata.
+    pub fn get_concrete(&self, name: &str) -> Option<&PackageMetadata> {
         self.packages.get(name).and_then(|versions| versions.first())
     }
     /// Get all available versions of a package (for backtracking resolver)
@@ -238,7 +282,7 @@ impl Registry {
                     // We don't have full dependency info — we'd need to download
                     // and parse each tarball's DESCRIPTION for that.
                     // For now, clone the latest version's metadata but swap the version.
-                    if let Some(latest) = self.get(pkg_name) {
+                    if let Some(latest) = self.get_concrete(pkg_name) {
                         let mut archived = latest.clone();
                         archived.version = version_str.to_string();
                         versions.push(archived);

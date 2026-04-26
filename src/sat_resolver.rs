@@ -166,7 +166,7 @@ pub async fn resolve_with_constraints(
         for (pkg_name, pkg_conflicts) in &conflicts {
             let available = registry
                 .get(pkg_name)
-                .map(|p| p.version.as_str())
+                .map(|p| p.version())
                 .unwrap_or("unknown");
 
             msg.push_str(&format!(
@@ -237,7 +237,7 @@ fn collect_with_constraints(
     let mut dep_names: Vec<String> = Vec::new();
 
     // Process Depends — collect names AND constraints
-    for dep in &metadata.depends {
+    for dep in metadata.depends() {
          if dep.name == "R" {
             // Don't add R as a package to install, but DO check the constraint
             if let Some(ref ver_req) = dep.version_req {
@@ -268,7 +268,7 @@ fn collect_with_constraints(
     }
 
     // Process Imports
-    for dep in &metadata.imports {
+    for dep in metadata.imports() {
         dep_names.push(dep.name.clone());
         if let Some(ref ver_req) = dep.version_req {
             if let Some(constraint) = VersionConstraint::parse(ver_req) {
@@ -282,7 +282,7 @@ fn collect_with_constraints(
     }
 
     // Process LinkingTo
-    for lt in &metadata.linking_to {
+    for lt in metadata.linking_to() {
         dep_names.push(lt.clone());
     }
 
@@ -299,10 +299,10 @@ fn collect_with_constraints(
 
     // Add this package after its deps (topological order)
     resolved.push(ResolvedPackage {
-        name: metadata.name.clone(),
-        version: metadata.version.clone(),
-        source: metadata.source.to_string(),
-        needs_compilation: metadata.needs_compilation,
+        name: metadata.name().to_string(),
+        version: metadata.version().to_string(),
+        source: metadata.source_label().to_string(),
+        needs_compilation: metadata.needs_compilation(),
         dependencies: dep_names,
         sha256: None,
     });
@@ -322,7 +322,7 @@ fn check_r_version(registry: &Registry, resolved: &[ResolvedPackage]) -> Result<
     for pkg in resolved {
         if let Some(metadata) = registry.get(&pkg.name) {
             // Check if any Depends has an R version constraint
-            for dep in &metadata.depends {
+            for dep in metadata.depends() {
                 if dep.name == "R" {
                     // This was filtered out by our parser, but just in case
                     if let Some(ref ver_req) = dep.version_req {
@@ -373,7 +373,7 @@ fn validate_constraints(
 
     for (target_name, target_constraints) in &by_target {
         let available = match registry.get(target_name) {
-            Some(pkg) => match RVersion::parse(&pkg.version) {
+            Some(pkg) => match RVersion::parse(pkg.version()) {
                 Some(v) => v,
                 None => continue,
             },
