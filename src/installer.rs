@@ -40,7 +40,7 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
     let total = resolved.packages.len();
     let mut installed: HashSet<String> = HashSet::new();
     let mut failed: Vec<(String, String)> = Vec::new(); // (name, error)
-
+    let mut retry_queue: HashSet<String> = HashSet::new();
     // Find packages already installed on this system
     let already_installed = check_installed_versions(&resolved.packages);
     for name in &already_installed {
@@ -132,8 +132,16 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
                     installed.insert(name);
                 }
                 Err(e) => {
-                    println!("  {} {} — {}", "✗".red(), name.red(), e);
-                    failed.push((name, e.to_string()));
+                    let err_msg = e.to_string();
+                    if err_msg.contains("lazy loading failed") && !retry_queue.contains(&name) {
+                        // First failure with lazy loading — retry in next tier
+                        println!("  {} {} — will retry next tier (lazy loading race)", "↻".yellow(), name.yellow());
+                        retry_queue.insert(name);
+                    } else {
+                        // Permanent failure (either not lazy loading, or already retried once)
+                        println!("  {} {} — {}", "✗".red(), name.red(), err_msg);
+                        failed.push((name, err_msg));
+                    }
                 }
             }
         }
@@ -324,6 +332,61 @@ fn parse_compile_error(stderr: &str) -> String {
     if stderr.contains("cmake") && stderr.contains("not found") {
         return "cmake not found or too old.\n  Fix: sudo apt install cmake".to_string();
     }
+    // Missing R package dependency
+    // e.g., "ERROR: dependency 'sitmo' is not available for package 'dqrng'"
+    if let Some(line) = stderr.lines().find(|l| l.contains("dependency") && l.contains("is not available")) {
+        // Extract the missing package name from between the quotes
+        let missing = line.split('\'').nth(1);
+        return match missing {
+            Some(pkg) => format!(
+                "Missing R dependency: {}\n  Fix: rv install {} first, then retry",
+                pkg, pkg
+            ),
+            None => format!(
+                "Missing R dependency (couldn't parse name).\n  Check the error output above for the missing package."
+            ),
+        };
+
+    }
+
+    // Lazy loading failure (parallel compilation race condition)
+    // e.g., "ERROR: lazy loading failed for package 'ggrepel'"
+    if stderr.contains("lazy loading failed") {
+        let pkg_name = stderr.lines()
+            .find(|l| l.contains("lazy loading failed"))
+            .and_then(|l| l.split('\'').nth(1))
+            .unwrap_or("unknown");
+        return format!(
+            "Lazy loading failed for '{}' — a dependency likely hasn't finished registering.\n  This is a timing issue, not a real error. Re-run rv install to retry.",
+            pkg_name
+        );
+    }
+
+    // Permission denied
+    if stderr.contains("Permission denied") || stderr.contains("cannot create directory") {
+        return "Permission denied when writing to library.\n  Fix: use rv venv to create a project-local library, or check directory permissions.".to_string();
+    }
+
+    // Disk space
+    if stderr.contains("No space left on device") {
+        return "Disk full — no space left on device.\n  Fix: free disk space and retry.".to_string();
+    }
+     // Fortran library path mismatch (macOS Makevars issue)
+    if stderr.contains("library 'gfortran' not found") 
+        || stderr.contains("/opt/gfortran/lib") 
+    {
+        return "Fortran library path mismatch — R is looking for gfortran in the wrong location.\n  Fix: update ~/.R/Makevars with the correct gfortran path.\n  Run rv audit for details.".to_string();
+    }
+
+    // Linker errors (missing system library at link time)
+    if stderr.contains("undefined reference to") 
+        || stderr.contains("symbol(s) not found")
+        || stderr.contains("ld: library not found") 
+    {
+        return "Linker error — a system library is missing or not found by the linker.\n  Fix: run rv audit to check system dependencies.".to_string();
+    }
+
+   
 
     // Generic: take the last meaningful error line
     let last_error = stderr
