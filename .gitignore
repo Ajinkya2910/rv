@@ -7,3 +7,6 @@ target/debug/rv.d
 target/debug/rv
 my-project/config.toml
 my-project/activate
+/target
+.rv-install-state.json
+my-project/
