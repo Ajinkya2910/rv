@@ -22,6 +22,20 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+/// GitHub-specific provenance for a resolved package.
+/// None for CRAN/Bioconductor packages.
+///
+/// RUST CONCEPT: nested struct with Option<T>
+/// We attach this as Option<GitHubSource> on ResolvedPackage. Most packages
+/// won't have it (None), GitHub-sourced ones will (Some(...)).
+#[derive(Debug, Clone)]
+pub struct GitHubSource {
+    pub owner: String,
+    pub repo: String,
+    pub commit_sha: String,
+    pub subdir: Option<String>,
+    pub tarball_sha256: String,
+}
 /// The result of dependency resolution
 #[derive(Debug)]
 pub struct ResolvedDeps {
@@ -37,7 +51,7 @@ pub struct ResolvedDeps {
 pub struct ResolvedPackage {
     pub name: String,
     pub version: String,
-    pub source: String, // "cran" or "bioc"
+    pub source: String, // "cran" or "bioc" or "github"
     pub needs_compilation: bool,
 
     /// Direct dependencies of this package
@@ -45,6 +59,8 @@ pub struct ResolvedPackage {
 
     /// SHA256 hash of the source tarball (for lockfile)
     pub sha256: Option<String>,
+     /// Populated for GitHub packages; None for registry packages.
+    pub github_source: Option<GitHubSource>,
 }
 
 /// Resolve the full dependency tree for a list of requested packages.
@@ -77,7 +93,20 @@ pub fn resolve(registry: &Registry, requested: &[String]) -> Result<ResolvedDeps
     }
 
     let duration = start.elapsed();
-
+    // Backfill github_source for any package whose name lives in the
+    // registry's github_packages bucket. The trait object lookup loses
+    // GitHub-specific fields; this restores them onto ResolvedPackage.
+    for pkg in &mut resolved {
+        if let Some(gh) = registry.github_packages.get(&pkg.name) {
+            pkg.github_source = Some(GitHubSource {
+                owner: gh.owner.clone(),
+                repo: gh.repo.clone(),
+                commit_sha: gh.commit_sha.clone(),
+                subdir: gh.subdir.clone(),
+                tarball_sha256: gh.tarball_sha256.clone(),
+            });
+        }
+    }
     Ok(ResolvedDeps {
         packages: resolved,
         duration_secs: duration.as_secs_f64(),
@@ -151,7 +180,8 @@ fn resolve_recursive(
         source: metadata.source_label().to_string(),
         needs_compilation: metadata.needs_compilation(),
         dependencies: dep_names,
-        sha256: None, // Computed later during download
+        sha256: None,
+         github_source: None,  // Computed later during download
     });
 
     Ok(())

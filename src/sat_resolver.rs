@@ -13,7 +13,7 @@
 // version from CRAN Archive and re-resolve the affected subtree.
 
 use crate::registry::Registry;
-use crate::resolver::{ResolvedDeps, ResolvedPackage};
+use crate::resolver::{GitHubSource,ResolvedDeps, ResolvedPackage};
 use crate::version::{RVersion, VersionConstraint};
 use crate::source::PackageSource;
 use crate::registry::github;
@@ -314,6 +314,20 @@ pub async fn resolve_with_constraints(
     }
 
     let duration = start.elapsed();
+    // Backfill github_source for any package whose name lives in the
+    // registry's github_packages bucket. The trait object lookup loses
+    // GitHub-specific fields; this restores them onto ResolvedPackage.
+    for pkg in &mut resolved {
+        if let Some(gh) = registry.github_packages.get(&pkg.name) {
+            pkg.github_source = Some(GitHubSource {
+                owner: gh.owner.clone(),
+                repo: gh.repo.clone(),
+                commit_sha: gh.commit_sha.clone(),
+                subdir: gh.subdir.clone(),
+                tarball_sha256: gh.tarball_sha256.clone(),
+            });
+        }
+    }
 
     Ok(ResolvedDeps {
         packages: resolved,
@@ -413,6 +427,7 @@ fn collect_with_constraints(
         needs_compilation: metadata.needs_compilation(),
         dependencies: dep_names,
         sha256: None,
+         github_source: None, 
     });
 
     Ok(())

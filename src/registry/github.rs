@@ -409,6 +409,35 @@ pub fn extract_description(tarball_path: &Path, subdir: Option<&str>) -> Result<
     bail!("No DESCRIPTION found in tarball{}", suggestion);
 }
 
+/// Find the package root inside an extracted tarball.
+///
+/// GitHub tarballs unpack into a top-level directory whose name we
+/// don't know in advance ({repo}-{sha}, {repo}-{tag}, sometimes
+/// truncated). Scan first-level dirs, return the one with a DESCRIPTION.
+pub fn find_package_root(extract_dir: &Path, subdir: Option<&str>) -> Result<PathBuf> {
+    for entry in std::fs::read_dir(extract_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let candidate = match subdir {
+            Some(sub) => entry.path().join(sub.trim_matches('/')),
+            None => entry.path(),
+        };
+        if candidate.join("DESCRIPTION").exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "No package root with DESCRIPTION found in {}{}",
+        extract_dir.display(),
+        match subdir {
+            Some(s) => format!(" (subdir: '{}')", s),
+            None => String::new(),
+        }
+    );
+}
+
 // --- Top-level orchestration ------------------------------------------------
 
 /// Resolve + download + extract + parse, returning fully-populated metadata.

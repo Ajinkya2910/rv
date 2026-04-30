@@ -236,6 +236,24 @@ async fn cmd_install(packages: &[String], retry: bool) -> Result<()> {
         .iter()
         .map(|s| source::PackageSource::parse(s))
         .collect::<Result<Vec<_>>>()?;
+    // Warn if installing GitHub packages outside a venv.
+    if !retry {
+        let has_github = parsed
+            .iter()
+            .any(|p| matches!(p, source::PackageSource::GitHub(_)));
+        let venv_active = std::env::var("RV_VENV").is_ok()
+            || std::path::Path::new(".rv/lib").exists();
+        if has_github && !venv_active {
+            println!(
+                "\n{} installing GitHub package outside a virtual environment.",
+                "warning:".yellow().bold()
+            );
+            println!(
+                "  GitHub packages may shadow CRAN versions in your system library."
+            );
+            println!("  Consider running `rv venv` first.\n");
+        }
+    }
 
     println!("{}", "Resolving dependencies...".dimmed());
     let mut registry = registry::Registry::fetch().await?;
@@ -357,6 +375,7 @@ async fn cmd_restore() -> Result<()> {
                 needs_compilation: false, // We don't store this in lockfile yet
                 dependencies: pkg.deps.clone(),
                 sha256: pkg.sha256.clone(),
+                 github_source: None, 
             })
             .collect(),
         duration_secs: 0.0,

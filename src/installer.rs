@@ -178,7 +178,13 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
 
 /// Install a single R package from source using R CMD INSTALL
 fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<()> {
-    // Construct the download URL
+    // GitHub packages: install from the cached tarball, skipping download.
+    if let Some(gh) = &pkg.github_source {
+        return install_from_github_tarball(pkg, gh);
+    }
+
+    // ── CRAN / Bioconductor path (unchanged) ──────────────────────────────
+
     let url = match pkg.source.as_str() {
         "cran" => format!(
             "https://cloud.r-project.org/src/contrib/{}_{}.tar.gz",
@@ -191,14 +197,11 @@ fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<(
         _ => anyhow::bail!("Unknown source: {}", pkg.source),
     };
 
-    // Download the tarball
-    // For MVP, use curl command. Production version would use reqwest.
     let download_dir = PathBuf::from("/tmp/rv-downloads");
     std::fs::create_dir_all(&download_dir)?;
 
-    // Use the clean version (without -N suffix) for both URL and filename
-    let clean_version = if let Some(pos) = pkg.version.rfind('-') {
-        let suffix = &pkg.version[pos+1..];
+    let _clean_version = if let Some(pos) = pkg.version.rfind('-') {
+        let suffix = &pkg.version[pos + 1..];
         if suffix.len() <= 2 && suffix.chars().all(|c| c.is_ascii_digit()) {
             pkg.version[..pos].to_string()
         } else {
@@ -210,31 +213,26 @@ fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<(
 
     let tarball_path = download_dir.join(format!("{}_{}.tar.gz", pkg.name, pkg.version));
     if tarball_path.exists() {
-        let size = std::fs::metadata(&tarball_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let size = std::fs::metadata(&tarball_path).map(|m| m.len()).unwrap_or(0);
         if size < 1000 {
             std::fs::remove_file(&tarball_path).ok();
         }
     }
 
     if !tarball_path.exists() {
-        // Try original version first
-        let status = Command::new("curl")
+        let _ = Command::new("curl")
             .args(["-sL", "-o"])
             .arg(&tarball_path)
             .arg(&url)
             .status()
             .context("curl not found — install curl")?;
 
-        // Check if we got a real file or an error page
-        let got_real_file = tarball_path.exists() 
+        let got_real_file = tarball_path.exists()
             && std::fs::metadata(&tarball_path).map(|m| m.len()).unwrap_or(0) > 1000;
 
-        // If failed and version has a dash, try without it (CRAN quirk)
         if !got_real_file {
             std::fs::remove_file(&tarball_path).ok();
-            
+
             if let Some(pos) = pkg.version.rfind('-') {
                 let stripped = &pkg.version[..pos];
                 let alt_url = format!(
@@ -242,21 +240,24 @@ fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<(
                     pkg.name, stripped
                 );
                 let alt_path = download_dir.join(format!("{}_{}.tar.gz", pkg.name, stripped));
-                
+
                 Command::new("curl")
                     .args(["-sL", "-o"])
                     .arg(&alt_path)
                     .arg(&alt_url)
                     .status()?;
 
-                if alt_path.exists() && std::fs::metadata(&alt_path).map(|m| m.len()).unwrap_or(0) > 1000 {
+                if alt_path.exists()
+                    && std::fs::metadata(&alt_path).map(|m| m.len()).unwrap_or(0) > 1000
+                {
                     std::fs::rename(&alt_path, &tarball_path).ok();
                 }
             }
         }
 
-        // If still no good file, try annotation repo (Bioconductor)
-        if !tarball_path.exists() || std::fs::metadata(&tarball_path).map(|m| m.len()).unwrap_or(0) < 1000 {
+        if !tarball_path.exists()
+            || std::fs::metadata(&tarball_path).map(|m| m.len()).unwrap_or(0) < 1000
+        {
             std::fs::remove_file(&tarball_path).ok();
             let annotation_url = url.replace("/bioc/", "/data/annotation/");
             let status = Command::new("curl")
@@ -271,32 +272,110 @@ fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<(
         }
     }
 
+    run_r_cmd_install(&tarball_path)
+}
 
-    // Install using R CMD INSTALL
-    // Use project-local library if .rv/lib/ exists
-     let lib_arg = get_venv_lib().map(|p| format!("--library={}", p.display()));
+/// Install a GitHub-sourced package from its already-downloaded tarball.
+///
+/// Day 2 cached the tarball at ~/.rv/cache/github/{owner}/{repo}/{sha}.tar.gz.
+/// We extract it to a unique temp dir, locate the package root, and run
+/// R CMD INSTALL pointing at the directory (not the tarball).
+///
+/// On success: clean up the temp dir.
+/// On failure: leave it so the user can inspect what went wrong.
+fn install_from_github_tarball(
+    pkg: &ResolvedPackage,
+    gh: &crate::resolver::GitHubSource,
+) -> Result<()> {
+    let cache_dir = github_cache_dir()?;
+    let tarball_path = cache_dir
+        .join("github")
+        .join(&gh.owner)
+        .join(&gh.repo)
+        .join(format!("{}.tar.gz", gh.commit_sha));
+
+    if !tarball_path.exists() {
+        anyhow::bail!(
+            "GitHub tarball missing from cache: {}\n\
+             Expected the resolver to have populated this. Try re-running.",
+            tarball_path.display()
+        );
+    }
+
+    // Unique temp dir per (owner, repo, full-sha) — no collision risk.
+    let tmp_extract = std::env::temp_dir().join(format!(
+        "rv-gh-{}-{}-{}",
+        gh.owner, gh.repo, gh.commit_sha
+    ));
+
+    // Clean any prior leftover from a failed run on the same SHA.
+    let _ = std::fs::remove_dir_all(&tmp_extract);
+    std::fs::create_dir_all(&tmp_extract)?;
+
+    extract_tarball(&tarball_path, &tmp_extract)
+        .with_context(|| format!("Failed to extract {}", tarball_path.display()))?;
+
+    let pkg_dir = crate::registry::github::find_package_root(
+        &tmp_extract,
+        gh.subdir.as_deref(),
+    )?;
+
+    match run_r_cmd_install(&pkg_dir) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&tmp_extract);
+            Ok(())
+        }
+        Err(e) => {
+            // Preserve the source so the user can inspect what failed.
+            eprintln!(
+                "  source preserved at {} for inspection",
+                tmp_extract.display()
+            );
+            Err(e.context(format!("Failed to install {} from GitHub", pkg.name)))
+        }
+    }
+}
+
+/// Extract a .tar.gz into a destination directory.
+fn extract_tarball(tarball: &PathBuf, dest: &PathBuf) -> Result<()> {
+    let file = std::fs::File::open(tarball)?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    archive.unpack(dest)?;
+    Ok(())
+}
+
+/// Where Day 2 wrote the GitHub cache. Mirrors prepare_github_packages.
+fn github_cache_dir() -> Result<PathBuf> {
+    let base = match std::env::var("HOME") {
+        Ok(h) => PathBuf::from(h).join(".rv").join("cache"),
+        Err(_) => std::env::temp_dir().join("rv-cache"),
+    };
+    std::fs::create_dir_all(&base)?;
+    Ok(base)
+}
+/// Run `R CMD INSTALL` against a tarball OR an extracted package directory.
+/// R CMD INSTALL accepts both — that's why this helper works for both paths.
+fn run_r_cmd_install(target: &PathBuf) -> Result<()> {
+    let lib_arg = get_venv_lib().map(|p| format!("--library={}", p.display()));
 
     let mut cmd = Command::new("R");
     cmd.args(["CMD", "INSTALL", "--no-test-load"]);
     if let Some(ref lib) = lib_arg {
         cmd.arg(lib);
     }
-    cmd.arg(&tarball_path);
+    cmd.arg(target);
 
     let output = cmd.output().context("R is not installed")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // Parse the error for a human-friendly message
         let friendly_error = parse_compile_error(&stderr);
-
         anyhow::bail!("{}", friendly_error);
     }
 
     Ok(())
 }
-
 /// Parse a compilation error and return a human-friendly message
 ///
 /// Instead of dumping 200 lines of g++ output, we extract the actual problem.
