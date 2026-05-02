@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 /// This doc comment (///) becomes the --help text automatically!
 #[derive(Parser)]
 #[command(name = "rv")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "Fast R package manager for life sciences")]
 pub struct Cli {
     /// The subcommand to run (resolve, audit, install, etc.)

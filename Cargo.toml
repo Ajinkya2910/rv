@@ -4,7 +4,7 @@
 
 [package]
 name = "rv"                          # The binary name: users will type `rv resolve DESeq2`
-version = "0.2.1"                    # Semantic versioning
+version = "0.2.2"                    # Semantic versioning
 edition = "2021"                     # Rust edition (like Python 3.x vs 2.x)
 description = "Fast R package manager for life sciences"
 license = "MIT"
