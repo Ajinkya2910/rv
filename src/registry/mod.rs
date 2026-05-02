@@ -332,10 +332,16 @@ impl Registry {
 async fn fetch_and_parse(url: &str, source: PackageSource) -> Result<Vec<PackageMetadata>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
-
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .no_gzip()  // we decompress manually with flate2
+        .build()?;
     // Download the gzipped PACKAGES file
-    let response = reqwest::get(url).await?.bytes().await?;
-
+    let response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP {} fetching {}", response.status(), url);
+    }
+   let response = response.bytes().await?;
     // Decompress gzip
     // RUST CONCEPT: Vec<u8> is a vector of bytes — like Python's bytes/bytearray.
     let mut decoder = GzDecoder::new(&response[..]);

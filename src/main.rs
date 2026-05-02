@@ -21,7 +21,7 @@ mod version;
 mod sat_resolver;
 mod source;
 // `use` brings items into scope — like `from X import Y` in Python
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cli::Cli;
 use clap::Parser;
 
@@ -363,25 +363,118 @@ async fn cmd_restore() -> Result<()> {
         lockfile.metadata.bioc_version
     );
 
-    // Convert locked packages into ResolvedPackages for the installer
+    // ── Verify integrity of every GitHub-sourced lockfile entry ──────────
+    // Re-download each pinned tarball and check SHA-256 against the lockfile.
+    // Mismatch → bail. This catches lockfile tampering and upstream rewrites
+    // before any install activity.
+    let github_count = lockfile.packages.iter().filter(|p| p.source == "github").count();
+
+    if github_count > 0 {
+        println!("{}", "Verifying GitHub package integrity...".dimmed());
+
+        let cache_dir = match std::env::var("HOME") {
+            Ok(h) => std::path::PathBuf::from(h).join(".rv").join("cache"),
+            Err(_) => std::env::temp_dir().join("rv-cache"),
+        };
+        std::fs::create_dir_all(&cache_dir)?;
+        let client = reqwest::Client::new();
+
+        for entry in &lockfile.packages {
+            if entry.source != "github" {
+                continue;
+            }
+
+            let repo = entry.repo.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} is source=github but lockfile has no repo field",
+                    entry.name
+                )
+            })?;
+            let r#ref = entry.r#ref.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} is source=github but lockfile has no ref field",
+                    entry.name
+                )
+            })?;
+            let expected_sha256 = entry.tarball_sha256.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} is source=github but lockfile has no tarball_sha256 — \
+                     cannot verify integrity",
+                    entry.name
+                )
+            })?;
+
+            let (owner, repo_name) = repo.split_once('/').ok_or_else(|| {
+                anyhow::anyhow!("Invalid repo field in lockfile: '{}'", repo)
+            })?;
+
+            let spec = source::GitHubSpec {
+                owner: owner.to_string(),
+                repo: repo_name.to_string(),
+                r#ref: Some(r#ref.clone()),
+                subdir: entry.subdir.clone(),
+            };
+
+            let short = &r#ref[..7.min(r#ref.len())];
+            print!("  {} gh:{}@{} ", "verifying".dimmed(), repo, short);
+
+            let (_path, actual_sha256) =
+                registry::github::download_tarball(&spec, r#ref, &cache_dir, &client)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to download {} for verification", entry.name)
+                    })?;
+
+            if &actual_sha256 != expected_sha256 {
+                println!("{}", "✗".red());
+                anyhow::bail!(
+                    "SHA-256 mismatch for {} ({}@{}):\n  \
+                     expected (lockfile): {}\n  \
+                     actual (downloaded): {}\n  \
+                     The lockfile may be corrupted, or the upstream tarball was rewritten.",
+                    entry.name, repo, r#ref, expected_sha256, actual_sha256
+                );
+            }
+            println!("{}", "✓".green());
+        }
+    }
+
+    // ── Convert locked packages into ResolvedPackages for the installer ──
+    // Populate github_source so the installer knows to use the cached tarball.
     let resolved = resolver::ResolvedDeps {
         packages: lockfile
             .packages
             .iter()
-            .map(|pkg| resolver::ResolvedPackage {
-                name: pkg.name.clone(),
-                version: pkg.version.clone(),
-                source: pkg.source.clone(),
-                needs_compilation: false, // We don't store this in lockfile yet
-                dependencies: pkg.deps.clone(),
-                sha256: pkg.sha256.clone(),
-                 github_source: None, 
+            .map(|pkg| {
+                let github_source = if pkg.source == "github" {
+                    let repo = pkg.repo.as_ref().unwrap();
+                    let (owner, repo_name) = repo.split_once('/').unwrap();
+                    Some(resolver::GitHubSource {
+                        owner: owner.to_string(),
+                        repo: repo_name.to_string(),
+                        commit_sha: pkg.r#ref.clone().unwrap(),
+                        subdir: pkg.subdir.clone(),
+                        tarball_sha256: pkg.tarball_sha256.clone().unwrap(),
+                    })
+                } else {
+                    None
+                };
+
+                resolver::ResolvedPackage {
+                    name: pkg.name.clone(),
+                    version: pkg.version.clone(),
+                    source: pkg.source.clone(),
+                    needs_compilation: false,
+                    dependencies: pkg.deps.clone(),
+                    sha256: pkg.sha256.clone(),
+                    github_source,
+                }
             })
             .collect(),
         duration_secs: 0.0,
     };
 
-    // Check what's already installed at the right version
+    // ── Skip-already-installed optimization (preserved from before) ──────
     println!("{}", "Checking installed packages...".dimmed());
     let already_installed = installer::check_installed_versions(&resolved.packages);
 
@@ -406,8 +499,7 @@ async fn cmd_restore() -> Result<()> {
         to_install.len()
     );
 
-    // Install missing packages
-    installer::install(&resolved,&lockfile.metadata.bioc_version).await?;
+    installer::install(&resolved, &lockfile.metadata.bioc_version).await?;
 
     println!(
         "\n{} Environment restored from rv.lock ({} packages)",

@@ -55,12 +55,33 @@ pub struct LockedPackage {
     pub version: String,
     pub source: String,
 
-    /// SHA256 hash of the source tarball for integrity verification
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
 
-    /// Direct dependencies (not transitive)
     pub deps: Vec<String>,
+
+    // ── GitHub-source fields ──────────────────────────────────────────
+    // All optional. None for CRAN/Bioc packages. Lockfiles written before
+    // GitHub support deserialize cleanly because every new field is Option.
+
+    /// "owner/repo", e.g. "satijalab/seurat-data"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+
+    /// Resolved 40-char commit SHA. Field name is `ref` in the TOML
+    /// because that's what users will read; `r#ref` here because `ref`
+    /// is a Rust keyword.
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<String>,
+
+    /// SHA-256 of the tarball at `ref`. Used for integrity verification
+    /// on `rv restore`. Mismatch → bail loudly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tarball_sha256: Option<String>,
+
+    /// Subdirectory inside the repo, for monorepos.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subdir: Option<String>,
 }
 
 /// Write a lockfile from resolved dependencies
@@ -83,12 +104,31 @@ pub fn write(resolved: &ResolvedDeps) -> Result<PathBuf> {
         packages: resolved
             .packages
             .iter()
-            .map(|pkg| LockedPackage {
-                name: pkg.name.clone(),
-                version: pkg.version.clone(),
-                source: pkg.source.clone(),
-                sha256: pkg.sha256.clone(),
-                deps: pkg.dependencies.clone(),
+            .map(|pkg| {
+                
+                // For GitHub packages, lift provenance fields out of
+                // ResolvedPackage.github_source.
+                let (repo, r#ref, tarball_sha256, subdir) = match &pkg.github_source {
+                    Some(gh) => (
+                        Some(format!("{}/{}", gh.owner, gh.repo)),
+                        Some(gh.commit_sha.clone()),
+                        Some(gh.tarball_sha256.clone()),
+                        gh.subdir.clone(),
+                    ),
+                    None => (None, None, None, None),
+                };
+
+                LockedPackage {
+                    name: pkg.name.clone(),
+                    version: pkg.version.clone(),
+                    source: pkg.source.clone(),
+                    sha256: pkg.sha256.clone(),
+                    deps: pkg.dependencies.clone(),
+                    repo,
+                    r#ref,
+                    tarball_sha256,
+                    subdir,
+                }
             })
             .collect(),
     };
@@ -170,6 +210,7 @@ mod tests {
                     needs_compilation: false,
                     dependencies: vec![],
                     sha256: None,
+                    github_source: None,
                 },
                 ResolvedPackage {
                     name: "S4Vectors".to_string(),
@@ -178,6 +219,7 @@ mod tests {
                     needs_compilation: true,
                     dependencies: vec!["BiocGenerics".to_string()],
                     sha256: None,
+                    github_source: None,
                 },
             ],
             duration_secs: 0.1,
@@ -196,5 +238,92 @@ mod tests {
 
         // Cleanup
         std::fs::remove_file(path).ok();
+    }
+
+#[test]
+    fn test_lockfile_github_roundtrip() {
+        use crate::resolver::GitHubSource;
+
+        let resolved = ResolvedDeps {
+            packages: vec![ResolvedPackage {
+                name: "SeuratData".to_string(),
+                version: "0.2.2.9002".to_string(),
+                source: "github".to_string(),
+                needs_compilation: false,
+                dependencies: vec!["Seurat".to_string()],
+                sha256: None,
+                github_source: Some(GitHubSource {
+                    owner: "satijalab".to_string(),
+                    repo: "seurat-data".to_string(),
+                    commit_sha: "3e51f44303069b64f5dc4d68e6a3d4a343f55c39".to_string(),
+                    subdir: None,
+                    tarball_sha256:
+                        "881ebe70a2a6c6574916925d9e3a70b66c32806ddc38a472d03f90e0a146fc00"
+                            .to_string(),
+                }),
+            }],
+            duration_secs: 0.0,
+        };
+
+        let path = std::env::temp_dir().join("rv-test-gh.lock");
+        // Reuse write() but redirect to temp — simplest is to write+read+cleanup
+        // through the real write() since it always writes to "rv.lock".
+        // For unit purposes, we serialize/deserialize directly:
+        let lockfile = Lockfile {
+            metadata: LockfileMetadata {
+                rv_version: "test".to_string(),
+                r_version: "4.4.0".to_string(),
+                bioc_version: "3.19".to_string(),
+                generated_at: "0".to_string(),
+            },
+            packages: vec![LockedPackage {
+                name: resolved.packages[0].name.clone(),
+                version: resolved.packages[0].version.clone(),
+                source: resolved.packages[0].source.clone(),
+                sha256: None,
+                deps: resolved.packages[0].dependencies.clone(),
+                repo: Some("satijalab/seurat-data".to_string()),
+                r#ref: Some(
+                    "3e51f44303069b64f5dc4d68e6a3d4a343f55c39".to_string(),
+                ),
+                tarball_sha256: Some(
+                    "881ebe70a2a6c6574916925d9e3a70b66c32806ddc38a472d03f90e0a146fc00"
+                        .to_string(),
+                ),
+                subdir: None,
+            }],
+        };
+
+        let toml = toml::to_string_pretty(&lockfile).unwrap();
+        assert!(toml.contains("repo = \"satijalab/seurat-data\""));
+        assert!(toml.contains("ref = \"3e51f44"));
+        assert!(toml.contains("tarball_sha256 ="));
+
+        let back: Lockfile = toml::from_str(&toml).unwrap();
+        assert_eq!(back.packages[0].repo.as_deref(), Some("satijalab/seurat-data"));
+        assert_eq!(back.packages[0].r#ref.as_ref().unwrap().len(), 40);
+        let _ = path; // unused
+    }
+
+    #[test]
+    fn test_lockfile_old_format_loads() {
+        // Lockfile written before GitHub support — no repo/ref/tarball_sha256/subdir.
+        let old_toml = r#"
+[metadata]
+rv_version = "0.1.0"
+r_version = "4.4.0"
+bioc_version = "3.19"
+generated_at = "0"
+
+[[package]]
+name = "BiocGenerics"
+version = "0.48.1"
+source = "bioc"
+deps = []
+"#;
+        let lockfile: Lockfile = toml::from_str(old_toml).unwrap();
+        assert_eq!(lockfile.packages.len(), 1);
+        assert!(lockfile.packages[0].repo.is_none());
+        assert!(lockfile.packages[0].r#ref.is_none());
     }
 }
