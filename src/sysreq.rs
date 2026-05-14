@@ -211,6 +211,60 @@ const RPM_MAP: &[(&str, &str)] = &[
     ("jags",                 "jags"),
 ];
 
+/// Debian canonical name → HPC module name hint (Bug #27).
+/// `module spider libgeos-dev` finds nothing; `module spider geos` finds it.
+/// Hand-curated mapping for known packages; generic fallback strips the
+/// `lib` prefix and `-dev`/`-devel` suffix.
+const MODULE_HINT_MAP: &[(&str, &str)] = &[
+    ("libcurl4-openssl-dev", "curl"),
+    ("libssl-dev",           "openssl"),
+    ("libxml2-dev",          "libxml2"),
+    ("libhdf5-dev",          "hdf5"),
+    ("libgsl-dev",           "gsl"),
+    ("libgit2-dev",          "libgit2"),
+    ("libsodium-dev",        "libsodium"),
+    ("libfontconfig1-dev",   "fontconfig"),
+    ("libharfbuzz-dev",      "harfbuzz"),
+    ("libfribidi-dev",       "fribidi"),
+    ("libfreetype6-dev",     "freetype"),
+    ("libpng-dev",           "libpng"),
+    ("libtiff5-dev",         "libtiff"),
+    ("libcairo2-dev",        "cairo"),
+    ("libpq-dev",            "postgresql"),
+    ("libmariadb-dev",       "mariadb"),
+    ("libgdal-dev",          "gdal"),
+    ("libgeos-dev",          "geos"),
+    ("libproj-dev",          "proj"),
+    ("libbz2-dev",           "bzip2"),
+    ("liblzma-dev",          "xz"),
+    ("libmagick++-dev",      "imagemagick"),
+    ("libavfilter-dev",      "ffmpeg"),
+    ("unixodbc-dev",         "unixODBC"),
+    ("build-essential",      "gcc"),
+    ("gfortran",             "gcc"),
+];
+
+/// Translate a Debian-canonical sysreq name to the most likely HPC module name.
+pub fn module_hint(debian_name: &str) -> String {
+    if let Some(hint) = MODULE_HINT_MAP
+        .iter()
+        .find(|(d, _)| *d == debian_name)
+        .map(|(_, m)| *m)
+    {
+        return hint.to_string();
+    }
+    let mut s = debian_name;
+    if let Some(stripped) = s.strip_prefix("lib") {
+        s = stripped;
+    }
+    if let Some(stripped) = s.strip_suffix("-dev") {
+        s = stripped;
+    } else if let Some(stripped) = s.strip_suffix("-devel") {
+        s = stripped;
+    }
+    s.to_string()
+}
+
 /// Linux apt name → macOS Homebrew name
 const BREW_MAP: &[(&str, &str)] = &[
     ("libcurl4-openssl-dev", "curl"),
@@ -574,8 +628,11 @@ pub async fn audit(resolved: &ResolvedDeps) -> Result<SysreqReport> {
     let on_hpc = is_hpc_environment();
     let os_info = os_release_info();
 
-    // Skip RSPM if macOS, HPC (likely no network), or no OS detected.
-    let use_rspm = !on_macos && !on_hpc && os_info.is_some();
+    //query RSPM whenever we have OS info, including on HPC.
+    // Login nodes have network; compute nodes typically don't, but the
+    // 3-second per-query timeout plus the rspm_unreachable short-circuit
+    // below limits the cost to one 3s hang on a no-network node.
+    let use_rspm = !on_macos && os_info.is_some();
     let mut rspm_cache = if use_rspm {
         let o = os_info.as_ref().unwrap();
         rspm::load(&o.distribution, &o.release)
@@ -588,6 +645,9 @@ pub async fn audit(resolved: &ResolvedDeps) -> Result<SysreqReport> {
         std::collections::HashMap::new();
     let mut uncertain: Vec<String> = Vec::new();
     let mut cache_dirty = false;
+    //  first failed RSPM query short-circuits the rest of the
+    // queries this run. Avoids 3s × N timeouts on compute nodes.
+    let mut rspm_unreachable = false;
 
     for pkg in &resolved.packages {
         let libs = lookup_sysreqs_for_pkg(
@@ -596,6 +656,7 @@ pub async fn audit(resolved: &ResolvedDeps) -> Result<SysreqReport> {
             use_rspm,
             &mut rspm_cache,
             &mut cache_dirty,
+            &mut rspm_unreachable,
             client.as_ref(),
         )
         .await;
@@ -667,10 +728,12 @@ async fn lookup_sysreqs_for_pkg(
     use_rspm: bool,
     rspm_cache: &mut rspm::Cache,
     cache_dirty: &mut bool,
+    rspm_unreachable: &mut bool,
     client: Option<&reqwest::Client>,
 ) -> Option<Vec<String>> {
-    // RSPM is CRAN-only. Bioc / GitHub / macOS / HPC skip straight to SYSREQ_MAP.
-    let rspm_eligible = use_rspm && pkg.source == "cran" && client.is_some();
+    // RSPM is CRAN-only. Bioc / GitHub / macOS skip straight to SYSREQ_MAP.
+    let rspm_eligible =
+        use_rspm && pkg.source == "cran" && client.is_some() && !*rspm_unreachable;
 
     if rspm_eligible {
         let os = os_info.as_ref().unwrap();
@@ -684,7 +747,9 @@ async fn lookup_sysreqs_for_pkg(
             *cache_dirty = true;
             return Some(libs);
         }
-        // RSPM miss → fall through to SYSREQ_MAP.
+        // Bug #31: first failed query marks RSPM unreachable for this run.
+        *rspm_unreachable = true;
+        // Fall through to SYSREQ_MAP.
     }
 
     // SYSREQ_MAP — for Bioc, GitHub, macOS, HPC, or RSPM fallback.

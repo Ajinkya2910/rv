@@ -583,7 +583,35 @@ fn get_venv_lib() -> Option<std::path::PathBuf> {
     }
     None
 }
+/// Return the set of all package names currently installed in the
+/// active R library (venv if active, system library otherwise).
+///
+/// Bug #28 enabling: the resolver uses this to recognize packages that
+/// are installed on disk but not in any registry — e.g. a GitHub-only
+/// package installed via a prior `rv install` invocation.
+pub fn list_installed_packages() -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
 
+    let r_code = match get_venv_lib() {
+        Some(lib) => format!(
+            "cat(rownames(installed.packages(lib.loc='{}')), sep='\\n')",
+            lib.display()
+        ),
+        None => "cat(rownames(installed.packages()), sep='\\n')".to_string(),
+    };
+
+    match Command::new("R")
+        .args(["--vanilla", "--slave", "-e", &r_code])
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => HashSet::new(), // Fail open: empty set = nothing pre-installed
+    }
+}
 /// Check which packages from the resolved set are already installed
 pub fn check_installed_versions(packages: &[ResolvedPackage]) -> Vec<String> {
 

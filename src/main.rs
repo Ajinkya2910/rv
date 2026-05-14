@@ -182,7 +182,7 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
         if sysreq::is_hpc_environment() {
             println!("\n{} HPC environment — resolve via the module system:", "Fix with:".bold());
             for dep in &report.missing {
-                println!("  module spider {}", dep.name);
+                println!("  module spider {}", sysreq::module_hint(&dep.name));
             }
             println!("  module load <name>/<version>   # for each lib above");
         } else if std::env::consts::OS == "macos" {
@@ -269,6 +269,18 @@ async fn cmd_install(packages: &[String], retry: bool,skip_sysreq: bool,
     let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).await?;
 
     let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
+
+    // write rv.lock immediately after resolve succeeds, so:
+    //   - `rv why` works mid-failure (it reads rv.lock)
+    //   - `rv install --retry` has a lockfile to read
+    //   - The lockfile reflects intent, not just successful completion
+    let lockfile_path = lockfile::write(&resolved)?;
+    println!(
+        "  {} Wrote {} ({} packages)",
+        "→".dimmed(),
+        lockfile_path.display(),
+        resolved.packages.len()
+    );
 
     // Pre-flight system dependency check
     // ── Pre-flight system dependency check (Bugs #1, #2) ───────────────
@@ -810,8 +822,8 @@ fn handle_missing_sysreqs(
         println!("  rv can't install system libraries on a cluster (no sudo).");
         println!("  Resolve through the module system:");
         for dep in &report.missing {
-            println!("    module spider {}", dep.name);
-        }
+                println!("  module spider {}", sysreq::module_hint(&dep.name));
+            }
         println!("    module load <name>/<version>   # for each lib above\n");
 
         print!(

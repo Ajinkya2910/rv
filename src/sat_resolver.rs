@@ -127,7 +127,13 @@ fn github_cache_dir() -> anyhow::Result<PathBuf> {
     Ok(base)
 }
 
-
+///  a dep that wasn't found in any registry but isn't yet known
+/// to be unrecoverable — we accumulate these and report all at the end.
+#[derive(Debug)]
+struct MissingDepInfo {
+    name: String,
+    required_by: String,
+}
 /// A constraint on a package, tracked with who imposed it
 #[derive(Debug, Clone)]
 struct Constraint {
@@ -146,10 +152,13 @@ pub async fn resolve_with_constraints(
 ) -> Result<ResolvedDeps> {
     let start = Instant::now();
 
-    // Phase 1: Walk the dependency tree, collecting packages and constraints
+    // pre-installed packages count as resolved.
+    let installed_set = crate::installer::list_installed_packages();
+
     let mut visited: HashSet<String> = HashSet::new();
     let mut resolved: Vec<ResolvedPackage> = Vec::new();
     let mut constraints: Vec<Constraint> = Vec::new();
+    let mut missing_deps: Vec<MissingDepInfo> = Vec::new();
 
     for pkg_name in requested {
         collect_with_constraints(
@@ -158,7 +167,37 @@ pub async fn resolve_with_constraints(
             &mut visited,
             &mut resolved,
             &mut constraints,
+            &installed_set,
+            &mut missing_deps,
         )?;
+    }
+
+    // Bug #32: report ALL missing deps at once, with actionable hint.
+    if !missing_deps.is_empty() {
+        let mut msg = format!("{}\n", "Missing dependencies:".red().bold());
+        for m in &missing_deps {
+            msg.push_str(&format!(
+                "  {} {} (needed by {})\n",
+                "✗".red(),
+                m.name.bold(),
+                m.required_by
+            ));
+        }
+        msg.push_str(&format!(
+            "\n{}\n",
+            "These aren't in CRAN, Bioconductor, your current R library, or any registered GitHub source.".dimmed()
+        ));
+        msg.push_str("If they're GitHub-hosted, install all of them together:\n  ");
+        msg.push_str("rv install ");
+        for m in &missing_deps {
+            msg.push_str(&format!("gh:<owner>/{} ", m.name));
+        }
+        msg.push_str(&format!("{}\n", requested.join(" ")));
+        msg.push_str(&format!(
+            "{}",
+            "(replace <owner> with the GitHub owner — e.g. gh:jinworks/CellChat)".dimmed()
+        ));
+        anyhow::bail!("{}", msg);
     }
 
     // Phase 2: Check R version compatibility
@@ -244,6 +283,7 @@ pub async fn resolve_with_constraints(
             let mut visited2: HashSet<String> = HashSet::new();
             let mut resolved2: Vec<ResolvedPackage> = Vec::new();
             let mut constraints2: Vec<Constraint> = Vec::new();
+            let mut missing_deps2: Vec<MissingDepInfo> = Vec::new();
 
             for pkg_name in requested {
                 collect_with_constraints(
@@ -252,14 +292,28 @@ pub async fn resolve_with_constraints(
                     &mut visited2,
                     &mut resolved2,
                     &mut constraints2,
+                    &installed_set,
+                    &mut missing_deps2,
                 )?;
+            }
+
+            // If new missing deps appeared, surface and bail (same shape as before).
+            if !missing_deps2.is_empty() {
+                anyhow::bail!(
+                    "Re-resolution after archive fallback surfaced new missing deps: {}",
+                    missing_deps2
+                        .iter()
+                        .map(|m| m.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
 
             // Re-validate
             let conflicts2 = validate_constraints(registry, &constraints2);
 
             if conflicts2.is_empty() {
-                verify_all_deps_resolved(&resolved2)?;
+                verify_all_deps_resolved(&resolved2, &installed_set)?;
                 let duration = start.elapsed();
                 return Ok(ResolvedDeps {
                     packages: resolved2,
@@ -267,7 +321,6 @@ pub async fn resolve_with_constraints(
                 });
             }
         }
-
         // Still have conflicts — report them
         use colored::Colorize;
         let mut msg = format!("{}\n", "Version conflicts detected:".red().bold());
@@ -314,7 +367,7 @@ pub async fn resolve_with_constraints(
         anyhow::bail!("{}", msg);
     }
 
-    verify_all_deps_resolved(&resolved)?;
+    verify_all_deps_resolved(&resolved,&installed_set)?;
     let duration = start.elapsed();
     Ok(ResolvedDeps {
         packages: resolved,
@@ -329,6 +382,8 @@ fn collect_with_constraints(
     visited: &mut HashSet<String>,
     resolved: &mut Vec<ResolvedPackage>,
     constraints: &mut Vec<Constraint>,
+    installed_set: &HashSet<String>,
+    missing_deps: &mut Vec<MissingDepInfo>,
 ) -> Result<()> {
    
     if visited.contains(pkg_name) {
@@ -401,20 +456,25 @@ fn collect_with_constraints(
     dep_names.dedup();
 
     // Recurse into dependencies
+    // Recurse into dependencies (Bugs #22, #28, #32).
     for dep_name in &dep_names {
         if registry.get(dep_name).is_some() {
-            collect_with_constraints(registry, dep_name, visited, resolved, constraints)?;
+            collect_with_constraints(
+                registry, dep_name, visited, resolved, constraints,
+                installed_set, missing_deps,
+            )?;
+        } else if installed_set.contains(dep_name) {
+            // Bug #28: dep is already installed in the active R library.
+            // Trust R's lazy-load to find it; don't add to install plan.
+            // (No metadata available — we'd need to reverse-engineer it from
+            // installed.packages(), which is more trouble than it's worth.)
         } else {
-            anyhow::bail!(
-                "Transitive dependency '{dep}' (needed by '{parent}') was not found \
-                 in CRAN, Bioconductor, or any registered GitHub source.\n  \
-                 If '{dep}' is a GitHub-only package, declare it in {parent}'s \
-                 DESCRIPTION via `Remotes: github::owner/{dep}`.\n  \
-                 If it's a Bioconductor data/experiment package, that repo is not \
-                 yet fetched by rv.",
-                dep = dep_name,
-                parent = pkg_name
-            );
+            // Bug #32: collect, don't bail. resolve_with_constraints
+            // reports all missing deps at once after the walk completes.
+            missing_deps.push(MissingDepInfo {
+                name: dep_name.clone(),
+                required_by: pkg_name.to_string(),
+            });
         }
     }
 
@@ -536,17 +596,24 @@ fn validate_constraints(
 /// also appears in `resolved`. If anything is missing here, the resolver
 /// itself has a bug — surface it loudly rather than producing a half-broken
 /// install plan.
-fn verify_all_deps_resolved(resolved: &[ResolvedPackage]) -> Result<()> {
+fn verify_all_deps_resolved(
+    resolved: &[ResolvedPackage],
+    installed_set: &HashSet<String>,
+) -> Result<()> {
     let resolved_names: HashSet<&str> =
         resolved.iter().map(|p| p.name.as_str()).collect();
 
     for pkg in resolved {
         for dep in &pkg.dependencies {
-            if !resolved_names.contains(dep.as_str()) {
+            // Bug #28: a dep counts as resolved if it's either in the install
+            // plan or already installed in the active library.
+            if !resolved_names.contains(dep.as_str())
+                && !installed_set.contains(dep.as_str())
+            {
                 anyhow::bail!(
                     "Resolver invariant violated: '{}' lists '{}' as a dependency \
-                     but '{}' was not resolved. This is an rv bug — please report \
-                     with the package spec you used.",
+                     but '{}' was not resolved and is not installed. This is an rv \
+                     bug — please report with the package spec you used.",
                     pkg.name, dep, dep
                 );
             }
